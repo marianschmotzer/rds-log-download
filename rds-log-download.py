@@ -85,7 +85,7 @@ class streamFiles(object):
         self.output = Output(debug)
         self.client = boto3.client('rds')
 
-    def copyLastChanges(self,instance,filenameToCopy,marker,f):
+    def copyLastChanges(self,instance,filenameToCopy,marker,outputFile):
         nextPortion=True
         while nextPortion:
             try:
@@ -94,9 +94,14 @@ class streamFiles(object):
             except Exception as e:
                 self.output.info("Download exception skipping:" + str(e))
                 break
-            f.write(logFilePortion['LogFileData'])
+
+            try:
+                outputFile.write(logFilePortion['LogFileData'])
+            except Exception as e:
+                self.output.info("Store exception skipping:" + str(e))
             nextPortion=logFilePortion['AdditionalDataPending']
             marker=logFilePortion['Marker']
+            outputFile.flush()
         return marker
 
     def run(self):
@@ -107,17 +112,17 @@ class streamFiles(object):
             currentFile=response['DescribeDBLogFiles'][len(response['DescribeDBLogFiles'])-1]
         else:
             currentFile=self.lastFile
-        destDir=self.targetdir + "/" + instance
+        destDir=self.targetdir + "/" + self.instance
         destFile=destDir + "/" + os.path.basename(currentFile['LogFileName'])
         f = open(destFile,'w')
         marker='0'
-        self.output.info("Streaming file " + os.path.basename(destFile) )
+        self.output.info("Streaming file " + destDir + "/" + os.path.basename(destFile) )
         while True :
             """Wait pooling interval seconds"""
             time.sleep(self.poolingInterval)
             response = self.client.describe_db_log_files(DBInstanceIdentifier=self.instance,FileLastWritten=0)
             lastFile=response['DescribeDBLogFiles'][len(response['DescribeDBLogFiles'])-1]
-            marker=self.copyLastChanges(instance=self.instance,filenameToCopy=currentFile['LogFileName'],marker=marker,f=f)
+            marker=self.copyLastChanges(instance=self.instance,filenameToCopy=currentFile['LogFileName'],marker=marker,outputFile=f)
             """check if source file haven't chaged"""
             if currentFile['LogFileName'] != lastFile['LogFileName']:
                 f.close()
@@ -155,7 +160,7 @@ class CopyFiles(object):
             statinfo = os.stat(destFile)
             if statinfo.st_size == fileSize :
                 self.output.info("File " + destFile + " exists with correct size skiping")
-                return 
+                return
             else:
                 f = open(destFile,'w')
         else:
@@ -197,6 +202,26 @@ class CopyFiles(object):
         return response['DescribeDBLogFiles'][numberOfFiles-1]
 
 
+def workerThread(instance,args,semaphore):
+        """
+        Thread class
+
+        """
+        instance = instance
+        targetdir=args['targetdir']
+        poolingInterval=args['poolingInterval']
+        maxLines=args['maxLines']
+        fromtime=args['fromtime']
+        debug=args['debug']
+
+        """Main method to execute all the things."""
+        output.info("Thread started " + instance )
+        semaphore.acquire()
+        lastFile=CopyFiles(instance,targetdir,fromtime,maxLines,debug).run()
+        semaphore.release()
+        streamFiles(instance,targetdir,maxLines,poolingInterval,lastFile,debug).run()
+
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(fromfile_prefix_chars='@',
         description="Copy logs from AWS RDS instance log to local filesystem",
@@ -207,8 +232,16 @@ if __name__ == '__main__':
                         dest="instancesToCopy",action="append",
                         help="List of instances to copy logs from." \
                               + "Can be specified multiple times. " )
+    parser.add_argument("-a","--allinstances",
+                        dest="allinstances",action="store_true",default=False,
+                        help="Detect instances automaticly." )
+    parser.add_argument("-e","--enginefilter", metavar="Filter this engines",
+                        dest="enginefilter",default=None,
+                        help="Filter only this engines when autodetect i on" )
     parser.add_argument("-t", "--targetdir", metavar="Target DIRECTORY", dest="targetdir",default='/tmp/',
                         help="Target top level directory ")
+    parser.add_argument("--maxthreads", metavar="Target DIRECTORY", dest="maxThreads",type=int,default=3,
+                        help="Maximum number of concurrent requests")
     parser.add_argument("-p", "--pooling", metavar="pooling interval",type=int,dest="poolingInterval",default=60,
                         help="AWS Pooling interval for streaming")
     parser.add_argument("-l", "--lines", metavar="LINES",type=int,dest="maxLines",default=1000,
@@ -219,9 +252,33 @@ if __name__ == '__main__':
                         help="Set level to debug " )
 
     args = vars(parser.parse_args())
+    output = Output(debug=args['debug'])
+    threads = []
+    """ we need to limit number of concurrent requests when downloading files otherwise AWS will break connection"""
+    semaphore=threading.BoundedSemaphore(args['maxThreads'])
+    """ Check if instances should be found automaticly or are specified"""
+    if args['allinstances']:
+        client=boto3.client('rds')
+        listOfAllDatabases = client.describe_db_instances()
+        listOfInstances=[]
+        for i in listOfAllDatabases['DBInstances']:
+            if args['enginefilter']== None:
+                listOfInstances.append(i['DBInstanceIdentifier'])
+            elif args['enginefilter']==i['Engine']:
+                listOfInstances.append(i['DBInstanceIdentifier'])
+            #print(i['DBInstanceIdentifier'])
+    else:
+        listOfInstances=args['instancesToCopy']
 
-    for instance in args['instancesToCopy']:
-        lastFile=CopyFiles(instance,args['targetdir'],args['fromtime'],args['maxLines'],args['debug']).run()
-        streamFiles(instance,args['targetdir'],args['maxLines'],args['poolingInterval'],lastFile,args['debug']).run()
-
+    for instance in listOfInstances:
+        try:
+            output.info("Starting thread for " + instance )
+            t = threading.Thread(target=workerThread,args=(instance,args,semaphore))
+            threads.append(t)
+            t.start()
+        except:
+           output.error("Error: unable to start thread")
+        #workerThread(instance,args)
+    for t in threads:
+        t.join()
 
